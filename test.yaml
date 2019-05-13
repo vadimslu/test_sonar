@@ -1,0 +1,81 @@
+---
+- hosts: localhost
+  gather_facts: no
+
+  vars:
+     k8s_api_url: https://cl0a0121.sunlifecorp.com:6443
+     yaml_file_dir: "{{ playbook_dir|default('.') }}/deploy_files"
+     repo_url: http://gq60@bitbucket.sunlifecorp.com:7990/scm/edte/weather-reference.git
+     app_url: "http://cl0a0121.sunlifecorp.com:"
+
+  environment:
+    PYTHONPATH: "{{ playbook_dir|default('.') }}/vadim_ansible/lib/python2.7/site-packages"
+
+  tasks:
+   - name: Pull deployment yaml files localy
+     git:
+       repo: '{{ repo_url }}'
+       dest: '{{ yaml_file_dir }}'
+       #refspec: '+refs/pull/*:refs/heads/*'
+       clone: yes
+       update: no
+
+   - name: Docker Image validation for latest TAG
+     shell: grep -n "latest" {{ yaml_file_dir }}/deployment.yaml | awk '/image:/ {print $2}'
+     register: docker_img
+
+   #- debug:
+   #     var: docker_img.stdout
+
+   - name: Deployment will fail when the latest tag doesn't exist in the image name
+     failed_when: docker_img.stdout == "image:"
+     fail: msg="latest tag doesn't exist in the '{{ yaml_file_dir }}/deployment.yaml' file, please add the latest into the image tag and try again"
+
+   - name: Check if the kustomization.yaml file is exists.
+     stat:
+       path: "{{ yaml_file_dir }}/kustomization.yaml"
+
+   - name: Check if the kustomization.yaml has namePrefix configured
+     shell: "grep -L namePrefix {{ yaml_file_dir }}/kustomization.yaml"
+     register: kust_label_check
+
+   - name: A task that only happens if the namePrefix doesn exist
+     failed_when: kust_label_check.stdout !=""
+     fail: msg="namePrefix doesn't exist in the '{{ kust_label_check.stdout }}' file, please add the commonLables and try again"
+
+   - name: Kustomize Build process
+     shell: "kustomize build '{{ yaml_file_dir }}' > '{{ yaml_file_dir }}'/final_deploy.yaml"
+
+   - name: Validate required python modules are installed
+     shell: python -c "import google.auth;import openshift; import kubernetes; import oauthlib; import requests_oauthlib"
+     register: shell_out
+     ignore_errors: yes
+
+   - set_fact: k8s_api_token={{ lookup('env','k8s_api_token') }}
+
+   - name: Deploy app into Kubernetes cluster
+     k8s:
+       host: '{{ k8s_api_url }}'
+       api_key: '{{ k8s_api_token }}'
+       src: '{{ yaml_file_dir }}/final_deploy.yaml'
+       #ssl_ca_cert: '{{ k8s_ssl_cert_file }}'
+       verify_ssl: no
+       state: '{{ state|default("present") }}'
+
+   - name: Wait for pod to be deployed
+     pause:
+        minutes: 1
+
+   - name: get NodePort for URL validation
+     shell: cat {{ yaml_file_dir }}/service.yaml | awk '/nodePort:/ {print $2}' | awk 'NR==1{print $1}'
+     register: nodeport
+
+   - name: Check that a page returns a status 200 and stop the deployment if the word WebSphere is not there.
+     uri:
+       url: "{{ app_url }}{{ nodeport.stdout }}"
+       #client_cert: '{{ ssl_cert }}'
+       validate_certs: False
+       return_content: yes
+       register: this
+       failed_when: "'WebSphere' not in this.content check if the container is actually running"
+
